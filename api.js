@@ -6,318 +6,386 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-// For proxying requests to another local service
-app.post("/send", async (req, res) => {
-  try {
-    const { number, message } = req.body;
+// ==================== CONSTANTS ====================
+const ROUTER_USERNAME = "stream";
+const ROUTER_PASSWORD = "stream123";
+const PORT = 80;
 
-    if (!number || !message) {
-      return res.status(400).json({ 
-        error: "Missing required fields", 
-        required: ["number", "message"] 
-      });
-    }
+// ==================== UTILITY FUNCTIONS ====================
 
-    // Forward to localhost:4050/sendagain
-
-    
-    const response = await axios.post('http://localhost:4050/send', {
-      number,
-      message
-    });
-
-    // Return exactly what we get from the target
-    res.json(response.data);
-
-  } catch (error) {
-    console.error("❌ Error:", error.message);
-    
-    if (error.response) {
-      // Target server responded with error status
-      res.status(error.response.status).json(error.response.data);
-    } else if (error.request) {
-      // Target server not reachable
-      res.status(503).json({ 
-        error: "Target server unavailable", 
-        details: "Cannot connect to localhost:4050" 
-      });
-    } else {
-      // Other errors
-      res.status(500).json({ 
-        error: "Internal server error", 
-        details: error.message 
-      });
-    }
-  }
-});
-
-
-
-
-
-
-
-// Import the PPPoE routes
-const pppoeRoutes = require("./pppoe.js");
-
-// Use PPPoE routes under /pppoe path
-app.use("/pppoe", pppoeRoutes);
-
-// Use stats routes under /stats path
-const statsRoutes = require("./stats.js");
-
-app.use("/stats", statsRoutes);
-
-// MikroTik credentials (always same)
-const ROUTER_USERNAME = "testapi";
-const ROUTER_PASSWORD = "testapi123";
-
-// Utility function to connect to MikroTik
+/**
+ * Connects to MikroTik router
+ */
 function connectToRouter({ ip, port }) {
   return new RouterOSAPI({
     host: ip,
     port: port,
     user: ROUTER_USERNAME,
     password: ROUTER_PASSWORD,
-    timeout: 5, // seconds
+    timeout: 5,
   });
 }
 
-// ==================== ADD HOTSPOT USER ====================
-app.post("/add-user", async (req, res) => {
-  // Extract required fields from request body
-  const { ip, port, username, password, profile, comment } = req.body;
-
-  // Validate that all required fields are present
-  if (!ip || !port || !username || !password || !profile) {
-    return res.status(400).json({ error: "Missing required fields" });
+/**
+ * Validates required fields in request body
+ */
+function validateRequiredFields(req, fields) {
+  for (const field of fields) {
+    if (!req.body[field]) {
+      return {
+        isValid: false,
+        error: `Missing required field: ${field}`,
+      };
+    }
   }
+  return { isValid: true };
+}
 
-  // Establish connection to the router
-  const conn = connectToRouter({ ip, port });
+// ==================== HOTSPOT HOST ROUTE ====================
 
-  try {
-    // Connect to the router
-    await conn.connect();
-
-    // Prepare MikroTik command parameters
-    const params = [
-      `=name=${username}`,
-      `=password=${password}`, 
-      `=profile=${profile}`,
-    ];
-
-    // Add comment if provided
-    if (comment) {
-      params.push(`=comment=${comment}`);
-    }
-
-    // Add new hotspot user with provided credentials
-    await conn.write("/ip/hotspot/user/add", params);
-
-    // Return success response
-    res.json({
-      success: true,
-      message: `✅ Hotspot user '${username}' created successfully`,
-    });
-  } catch (err) {
-    // Log and handle any errors that occur during the process
-    console.error("❌ [Add User Error]:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message || "Unknown error",
-    });
-  } finally {
-    // Ensure connection is closed even if errors occur
-    conn.close().catch(() => {});
-  }
-});
-
-// ==================== DELETE HOTSPOT USER ====================
-app.post("/delete-user", async (req, res) => {
-  const { ip, port, username } = req.body;
-
-  if (!ip || !port || !username) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-
-  const conn = connectToRouter({ ip, port });
-
-  try {
-    await conn.connect();
-
-    // 1️⃣ Find and remove any active sessions
-    const activeSessions = await conn.write("/ip/hotspot/active/print", [
-      `?user=${username}`,
-    ]);
-
-    let sessionsTerminated = 0;
-    for (const session of activeSessions) {
-      if (session[".id"]) {
-        await conn.write("/ip/hotspot/active/remove", [`.id=${session[".id"]}`]);
-        sessionsTerminated++;
-      }
-    }
-
-    console.log(`🔌 Terminated ${sessionsTerminated} active sessions for '${username}'`);
-
-    // 2️⃣ Find the user entry
-    const users = await conn.write("/ip/hotspot/user/print", [
-      `?name=${username}`,
-    ]);
-
-    if (users.length === 0) {
-      return res.json({
-        success: true,
-        message: `User '${username}' not found, but terminated ${sessionsTerminated} active sessions`,
-        sessionsTerminated,
-      });
-    }
-
-    // 3️⃣ Remove user by ID
-    const userId = users[0][".id"];
-    if (userId) {
-      await conn.write("/ip/hotspot/user/remove", [`.id=${userId}`]);
-      console.log(`🗑️ Removed user '${username}' from hotspot list`);
-    }
-
-    res.json({
-      success: true,
-      message: `✅ User '${username}' deleted and ${sessionsTerminated} sessions terminated`,
-      sessionsTerminated,
-    });
-
-  } catch (err) {
-    console.error("❌ [Delete User Error]:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message || "Unknown error",
-    });
-  } finally {
-    conn.close().catch(() => {});
-  }
-});
-
-app.post("/delete-userv7", async (req, res) => {
-  const { ip, port, username } = req.body;
-
-  if (!ip || !port || !username) {
-    return res.status(400).json({ error: "Missing required fields (ip, port, username)" });
-  }
-
-  const api = connectToRouter({ ip, port });
-  console.log(`🚀 Connecting to RouterOS at ${ip}:${port}...`);
-
-  try {
-    await api.connect();
-    console.log("✅ Connected to RouterOS v7");
-
-    // Step 1️⃣: Find the user
-    const users = await api.write("/ip/hotspot/user/print");
-    const target = users.find((u) => u.name === username);
-
-    if (!target) {
-      console.log(`⚠️ User '${username}' not found.`);
-      await api.close();
-      return res.json({
-        success: true,
-        message: `User '${username}' not found.`,
-        sessionsTerminated: 0,
-      });
-    }
-
-    console.log(`📋 Found user '${username}' with ID ${target[".id"]}`);
-
-    // Step 2️⃣: Remove the user first
-    console.log(`🗑️ Removing user '${username}' (${target[".id"]})...`);
-    await api.write("/ip/hotspot/user/remove", [`=.id=${target[".id"]}`]);
-    console.log("✅ User removed successfully!");
-
-    // Step 3️⃣: Now remove any active sessions
-    console.log("🔍 Checking for active sessions...");
-    const activeSessions = await api.write("/ip/hotspot/active/print");
-    const userSessions = activeSessions.filter((a) => a.user === username);
-
-    let sessionsTerminated = 0;
-    for (const session of userSessions) {
-      if (session[".id"]) {
-        console.log(`🔌 Removing active session (${session[".id"]}) for '${username}'...`);
-        await api.write("/ip/hotspot/active/remove", [`=.id=${session[".id"]}`]);
-        sessionsTerminated++;
-      }
-    }
-
-    if (sessionsTerminated > 0) {
-      console.log(`✅ Removed ${sessionsTerminated} active session(s) for '${username}'.`);
-    } else {
-      console.log("ℹ️ No active sessions found for this user.");
-    }
-
-    // Step 4️⃣: Respond to client
-    res.json({
-      success: true,
-      message: `✅ User '${username}' deleted first, then ${sessionsTerminated} active session(s) removed.`,
-      sessionsTerminated,
-    });
-
-  } catch (err) {
-    console.error("❌ [Delete User v7 Error]:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message || "Unknown error occurred",
-    });
-  } finally {
-    await api.close().catch(() => {});
-    console.log("🔒 Connection closed");
-  }
-});
-
-
-// ==================== GET HOTSPOT STATS ====================
-app.post("/hotspot-stats", async (req, res) => {
+/**
+ * GET /ip/hotspot/host - List all hotspot hosts
+ */
+app.post("/ip/hotspot/host", async (req, res) => {
   const { ip, port } = req.body;
-
-  if (!ip || !port) {
-    return res.status(400).json({ error: "Missing required fields" });
+  
+  // Validate required fields
+  const validation = validateRequiredFields(req, ["ip", "port"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
   }
 
   const conn = connectToRouter({ ip, port });
 
   try {
     await conn.connect();
-
-    // 1. Get all hotspot users
-    const users = await conn.write("/ip/hotspot/user/print");
-
-    // 2. Get all active sessions
-    const active = await conn.write("/ip/hotspot/active/print");
+    
+    // Fetch hotspot hosts
+    const hosts = await conn.write("/ip/hotspot/host/print");
+    
+    // Format response
+    const formattedHosts = hosts.map(host => ({
+      id: host[".id"],
+      macAddress: host["mac-address"] || "N/A",
+      address: host.address || "N/A",
+      toAddress: host["to-address"] || "N/A",
+      server: host.server || "all",
+      uptime: host.uptime || "N/A",
+      idleTime: host["idle-time"] || "N/A",
+      authorized: host.authorized || false,
+      bypassed: host.bypassed || false,
+      comment: host.comment || "",
+      blocked: host.blocked || false,
+      disabled: host.disabled || false,
+    }));
 
     res.json({
       success: true,
-      stats: {
-        totalUsers: users.length,
-        activeUsers: active.length,
-      },
-      details: {
-        users: users.map(u => ({
-          id: u[".id"],
-          name: u.name,
-          profile: u.profile,
-        })),
-        active: active.map(a => ({
-          id: a[".id"],
-          user: a.user,
-          address: a.address,
-          mac: a["mac-address"],
-          uptime: a.uptime,
-        })),
-      },
+      totalHosts: formattedHosts.length,
+      hosts: formattedHosts,
     });
+
   } catch (err) {
-    console.error("❌ [Hotspot Stats Error]:", err);
+    console.error("❌ [Hotspot Host Error]:", err.message);
     res.status(500).json({
       success: false,
-      error: err.message || "Unknown error",
+      error: err.message || "Failed to fetch hotspot hosts",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+// ==================== HOTSPOT HOST DETAILS ====================
+
+/**
+ * GET /ip/hotspot/host/details - Get detailed information about a specific host
+ */
+app.post("/ip/hotspot/host/details", async (req, res) => {
+  const { ip, port, hostId } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port", "hostId"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    // Get specific host by ID
+    const hosts = await conn.write("/ip/hotspot/host/print", [
+      `?.id=${hostId}`
+    ]);
+    
+    if (hosts.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: `Host with ID ${hostId} not found`,
+      });
+    }
+
+    const host = hosts[0];
+    
+    res.json({
+      success: true,
+      host: {
+        id: host[".id"],
+        macAddress: host["mac-address"],
+        address: host.address,
+        toAddress: host["to-address"],
+        server: host.server,
+        uptime: host.uptime,
+        idleTime: host["idle-time"],
+        authorized: host.authorized,
+        bypassed: host.bypassed,
+        comment: host.comment,
+        blocked: host.blocked,
+        disabled: host.disabled,
+        // Additional fields if they exist
+        bytesIn: host["bytes-in"],
+        bytesOut: host["bytes-out"],
+        packetsIn: host["packets-in"],
+        packetsOut: host["packets-out"],
+        foundBy: host["found-by"],
+        lastSeen: host["last-seen"],
+      },
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Details Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to fetch host details",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+// ==================== HOTSPOT HOST FILTER ====================
+
+/**
+ * POST /ip/hotspot/host/filter - Filter hosts by criteria
+ */
+app.post("/ip/hotspot/host/filter", async (req, res) => {
+  const { ip, port, filterBy, filterValue } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port", "filterBy", "filterValue"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    // Build filter query based on filterBy parameter
+    let filterQuery = "";
+    switch (filterBy) {
+      case "mac":
+        filterQuery = `?mac-address=${filterValue}`;
+        break;
+      case "ip":
+        filterQuery = `?address=${filterValue}`;
+        break;
+      case "authorized":
+        filterQuery = `?authorized=${filterValue}`;
+        break;
+      case "server":
+        filterQuery = `?server=${filterValue}`;
+        break;
+      default:
+        filterQuery = `?${filterBy}=${filterValue}`;
+    }
+
+    const hosts = await conn.write("/ip/hotspot/host/print", [filterQuery]);
+    
+    const formattedHosts = hosts.map(host => ({
+      id: host[".id"],
+      macAddress: host["mac-address"] || "N/A",
+      address: host.address || "N/A",
+      authorized: host.authorized || false,
+      uptime: host.uptime || "N/A",
+    }));
+
+    res.json({
+      success: true,
+      filter: { by: filterBy, value: filterValue },
+      totalFound: formattedHosts.length,
+      hosts: formattedHosts,
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Filter Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to filter hosts",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+// ==================== HOTSPOT HOST MANAGEMENT ====================
+
+/**
+ * POST /ip/hotspot/host/remove - Remove a hotspot host
+ */
+app.post("/ip/hotspot/host/remove", async (req, res) => {
+  const { ip, port, hostId } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port", "hostId"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    // Remove the host
+    await conn.write("/ip/hotspot/host/remove", [`=.id=${hostId}`]);
+    
+    res.json({
+      success: true,
+      message: `Host ${hostId} removed successfully`,
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Remove Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to remove host",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+/**
+ * POST /ip/hotspot/host/enable - Enable a disabled host
+ */
+app.post("/ip/hotspot/host/enable", async (req, res) => {
+  const { ip, port, hostId } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port", "hostId"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    await conn.write("/ip/hotspot/host/enable", [`=.id=${hostId}`]);
+    
+    res.json({
+      success: true,
+      message: `Host ${hostId} enabled successfully`,
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Enable Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to enable host",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+/**
+ * POST /ip/hotspot/host/disable - Disable a host
+ */
+app.post("/ip/hotspot/host/disable", async (req, res) => {
+  const { ip, port, hostId } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port", "hostId"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    await conn.write("/ip/hotspot/host/disable", [`=.id=${hostId}`]);
+    
+    res.json({
+      success: true,
+      message: `Host ${hostId} disabled successfully`,
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Disable Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to disable host",
+    });
+  } finally {
+    conn.close().catch(() => {});
+  }
+});
+
+// ==================== HOTSPOT HOST STATISTICS ====================
+
+/**
+ * POST /ip/hotspot/host/statistics - Get hotspot host statistics
+ */
+app.post("/ip/hotspot/host/statistics", async (req, res) => {
+  const { ip, port } = req.body;
+  
+  const validation = validateRequiredFields(req, ["ip", "port"]);
+  if (!validation.isValid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const conn = connectToRouter({ ip, port });
+
+  try {
+    await conn.connect();
+    
+    const hosts = await conn.write("/ip/hotspot/host/print");
+    
+    // Calculate statistics
+    const statistics = {
+      total: hosts.length,
+      authorized: hosts.filter(h => h.authorized === true).length,
+      unauthorized: hosts.filter(h => h.authorized === false).length,
+      disabled: hosts.filter(h => h.disabled === true).length,
+      blocked: hosts.filter(h => h.blocked === true).length,
+      bypassed: hosts.filter(h => h.bypassed === true).length,
+      byServer: {},
+    };
+
+    // Group by server
+    hosts.forEach(host => {
+      const server = host.server || 'unknown';
+      statistics.byServer[server] = (statistics.byServer[server] || 0) + 1;
+    });
+
+    res.json({
+      success: true,
+      statistics,
+      summary: {
+        activeHosts: statistics.authorized,
+        inactiveHosts: statistics.unauthorized,
+        blockedHosts: statistics.blocked,
+      },
+    });
+
+  } catch (err) {
+    console.error("❌ [Hotspot Host Statistics Error]:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Failed to get statistics",
     });
   } finally {
     conn.close().catch(() => {});
@@ -325,81 +393,68 @@ app.post("/hotspot-stats", async (req, res) => {
 });
 
 // ==================== HEALTH CHECK ====================
+
+/**
+ * GET / - Health check endpoint
+ */
 app.get("/", (req, res) => {
   res.json({
-    message: "MikroTik API Server is running",
+    message: "MikroTik Hotspot Host API Server is running",
+    version: "1.0.0",
     endpoints: {
-      hotspot: [
-        "POST /add-user",
-        "POST /delete-user", 
-        "POST /hotspot-stats"
+      hotspotHosts: [
+        "POST /ip/hotspot/host - List all hotspot hosts",
+        "POST /ip/hotspot/host/details - Get host details by ID",
+        "POST /ip/hotspot/host/filter - Filter hosts by criteria",
+        "POST /ip/hotspot/host/remove - Remove a host",
+        "POST /ip/hotspot/host/enable - Enable a disabled host",
+        "POST /ip/hotspot/host/disable - Disable a host",
+        "POST /ip/hotspot/host/statistics - Get host statistics",
       ],
-      pppoe: [
-        "POST /pppoe/secrets",
-        "POST /pppoe/add-secret",
-        "POST /pppoe/delete-secret",
-        "POST /pppoe/active",
-        "POST /pppoe/profiles"
-      ],
-      stats: [
-        "POST /router/hotspot/active",
-        "POST /router/hotspot/users",
-        "POST /router/hotspot/users",
-        "POST /router/interfaces"
-
-      ]
-    }
+    },
   });
 });
 
-// ==================== START SERVER ====================
-const PORT = 80;
+// ==================== SERVER STARTUP ====================
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📡 Hotspot endpoints available at: /add-user, /delete-user, /hotspot-stats`);
-  console.log(`stats endpoints available at: /stats/*`);
-  console.log(`🔗 PPPoE endpoints available at: /pppoe/*`);
+  console.log(`📡 Hotspot Host endpoints available at:`);
+  console.log(`   POST /ip/hotspot/host`);
+  console.log(`   POST /ip/hotspot/host/details`);
+  console.log(`   POST /ip/hotspot/host/filter`);
+  console.log(`   POST /ip/hotspot/host/remove`);
+  console.log(`   POST /ip/hotspot/host/enable`);
+  console.log(`   POST /ip/hotspot/host/disable`);
+  console.log(`   POST /ip/hotspot/host/statistics`);
 });
 
+// ==================== ERROR HANDLING ====================
 
-
-// ==================== GLOBAL ERROR HANDLERS ====================
-
-// Keep track of pending responses
-const activeResponses = new Set();
-
-app.use((req, res, next) => {
-  activeResponses.add(res);
-  res.on("finish", () => activeResponses.delete(res));
-  next();
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error("💥 Global Error:", err.message);
+  res.status(500).json({
+    success: false,
+    error: "Internal server error",
+    details: process.env.NODE_ENV === "development" ? err.message : undefined,
+  });
 });
 
-// Prevent the app from crashing on unhandled rejections or exceptions
-process.on("uncaughtException", (err) => {
-  console.error("💥 Uncaught Exception:", err);
-
-  // Try to send error response to any active requests
-  for (const res of activeResponses) {
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: "Server crashed unexpectedly. Please try again.",
-        details: err.message || "Unknown error",
-      });
-    }
-  }
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("💥 Unhandled Rejection:", reason);
-
-  for (const res of activeResponses) {
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: "Unhandled promise rejection occurred.",
-        details: reason?.message || reason || "Unknown reason",
-      });
-    }
-  }
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint not found",
+    availableEndpoints: [
+      "POST /ip/hotspot/host",
+      "POST /ip/hotspot/host/details",
+      "POST /ip/hotspot/host/filter",
+      "POST /ip/hotspot/host/remove",
+      "POST /ip/hotspot/host/enable",
+      "POST /ip/hotspot/host/disable",
+      "POST /ip/hotspot/host/statistics",
+      "GET / - Health check",
+    ],
+  });
 });

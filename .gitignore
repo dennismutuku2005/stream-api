@@ -42,12 +42,5 @@ Thumbs.db
 # Optional eslint cache
 .eslintcache
 
-# TypeScript build cache
-*.tsbuildinfo
-
-# Logs
-logs
-*.log
-
 # Docker
 docker-compose.override.yml
